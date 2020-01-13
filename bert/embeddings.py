@@ -44,9 +44,7 @@ class PositionEmbeddingLayer(bert.Layer):
         # that seq_len is less than max_position_embeddings
         seq_len = inputs
 
-        assert_op = tf.compat.v1.assert_less_equal(seq_len, self.params.max_position_embeddings)
-        # TODO: TF < v2.0
-        # assert_op = tf.assert_less_equal(seq_len, self.params.max_position_embeddings)
+        assert_op = tf.compat.v2.debugging.assert_less_equal(seq_len, self.params.max_position_embeddings)
 
         with tf.control_dependencies([assert_op]):
             # slice to seq_len
@@ -57,8 +55,48 @@ class PositionEmbeddingLayer(bert.Layer):
         return output
 
 
+class EmbeddingsProjector(bert.Layer):
+    class Params(bert.Layer.Params):
+        hidden_size                  = 768
+        embedding_size               = None   # None for BERT, not None for ALBERT
+        project_embeddings_with_bias = True   # in ALBERT - True for Google, False for brightmart/albert_zh
+
+    # noinspection PyUnusedLocal
+    def _construct(self, params: Params):
+        self.projector_layer      = None   # for ALBERT
+        self.projector_bias_layer = None   # for ALBERT
+
+    def build(self, input_shape):
+        emb_shape = input_shape
+        self.input_spec = keras.layers.InputSpec(shape=emb_shape)
+        assert emb_shape[-1] == self.params.embedding_size
+
+        # ALBERT word embeddings projection
+        self.projector_layer = self.add_weight(name="projector",
+                                               shape=[self.params.embedding_size,
+                                                      self.params.hidden_size],
+                                               dtype=K.floatx())
+        if self.params.project_embeddings_with_bias:
+            self.projector_bias_layer = self.add_weight(name="bias",
+                                                        shape=[self.params.hidden_size],
+                                                        dtype=K.floatx())
+        super(EmbeddingsProjector, self).build(input_shape)
+
+    def call(self, inputs, **kwargs):
+        input_embedding = inputs
+        assert input_embedding.shape[-1] == self.params.embedding_size
+
+        # ALBERT: project embedding to hidden_size
+        output = tf.matmul(input_embedding, self.projector_layer)
+        if self.projector_bias_layer is not None:
+            output = tf.add(output, self.projector_bias_layer)
+
+        return output
+
+
 class BertEmbeddingsLayer(bert.Layer):
-    class Params(PositionEmbeddingLayer.Params):
+    class Params(PositionEmbeddingLayer.Params,
+                 EmbeddingsProjector.Params):
         vocab_size               = None
         use_token_type           = True
         use_position_embeddings  = True
@@ -66,18 +104,28 @@ class BertEmbeddingsLayer(bert.Layer):
         hidden_size              = 768
         hidden_dropout           = 0.1
 
-        embedding_size           = None   # None for BERT, not None for ALBERT
+        extra_tokens_vocab_size  = None  # size of the extra (task specific) token vocabulary (using negative token ids)
+
+        #
+        # ALBERT support - set embedding_size (or None for BERT)
+        #
+        embedding_size               = None   # None for BERT, not None for ALBERT
+        project_embeddings_with_bias = True   # in ALBERT - True for Google, False for brightmart/albert_zh
+        project_position_embeddings  = True   # in ALEBRT - True for Google, False for brightmart/albert_zh
+
+        mask_zero                    = False
 
     # noinspection PyUnusedLocal
     def _construct(self, params: Params):
         self.word_embeddings_layer       = None
-        self.word_embeddings_2_layer     = None   # for ALBERT
+        self.extra_word_embeddings_layer = None   # for task specific tokens (negative token ids)
         self.token_type_embeddings_layer = None
         self.position_embeddings_layer   = None
+        self.word_embeddings_projector_layer = None   # for ALBERT
         self.layer_norm_layer = None
         self.dropout_layer    = None
 
-        self.support_masking = True
+        self.support_masking = params.mask_zero
 
     # noinspection PyAttributeOutsideInit
     def build(self, input_shape):
@@ -90,30 +138,43 @@ class BertEmbeddingsLayer(bert.Layer):
             input_ids_shape = input_shape
             self.input_spec = keras.layers.InputSpec(shape=input_ids_shape)
 
+        # use either hidden_size for BERT or embedding_size for ALBERT
+        embedding_size = self.params.hidden_size if self.params.embedding_size is None else self.params.embedding_size
+
         self.word_embeddings_layer = keras.layers.Embedding(
             input_dim=self.params.vocab_size,
-            output_dim=self.params.hidden_size if self.params.embedding_size is None else self.params.embedding_size,
-            mask_zero=True,  # =self.params.mask_zero,
+            output_dim=embedding_size,
+            mask_zero=self.params.mask_zero,
             name="word_embeddings"
         )
+        if self.params.extra_tokens_vocab_size is not None:
+            self.extra_word_embeddings_layer = keras.layers.Embedding(
+                input_dim=self.params.extra_tokens_vocab_size + 1,  # +1 is for a <pad>/0 vector
+                output_dim=embedding_size,
+                mask_zero=self.params.mask_zero,
+                embeddings_initializer=self.create_initializer(),
+                name="extra_word_embeddings"
+            )
+
+        # ALBERT word embeddings projection
         if self.params.embedding_size is not None:
-            # ALBERT word embeddings projection
-            self.word_embeddings_2_layer = self.add_weight(name="word_embeddings_2/embeddings",
-                                                           shape=[self.params.embedding_size,
-                                                                  self.params.hidden_size],
-                                                           dtype=K.floatx())
+            self.word_embeddings_projector_layer = EmbeddingsProjector.from_params(
+                self.params, name="word_embeddings_projector")
+
+        position_embedding_size = embedding_size if self.params.project_position_embeddings else self.params.hidden_size
 
         if self.params.use_token_type:
             self.token_type_embeddings_layer = keras.layers.Embedding(
                 input_dim=self.params.token_type_vocab_size,
-                output_dim=self.params.hidden_size,
+                output_dim=position_embedding_size,
                 mask_zero=False,
                 name="token_type_embeddings"
             )
         if self.params.use_position_embeddings:
             self.position_embeddings_layer = PositionEmbeddingLayer.from_params(
                 self.params,
-                name="position_embeddings"
+                name="position_embeddings",
+                hidden_size=position_embedding_size
             )
 
         self.layer_norm_layer = pf.LayerNormalization(name="LayerNorm")
@@ -130,9 +191,23 @@ class BertEmbeddingsLayer(bert.Layer):
             token_type_ids = None
 
         input_ids = tf.cast(input_ids, dtype=tf.int32)
-        embedding_output = self.word_embeddings_layer(input_ids)
-        if self.word_embeddings_2_layer is not None:  # ALBERT: project embedding to hidden_size
-            embedding_output = tf.matmul(embedding_output, self.word_embeddings_2_layer)
+
+        if self.extra_word_embeddings_layer is not None:
+            token_mask   = tf.cast(tf.greater_equal(input_ids, 0), tf.int32)
+            extra_mask   = tf.cast(tf.less(input_ids, 0), tf.int32)
+            token_ids    = token_mask * input_ids
+            extra_tokens = extra_mask * (-input_ids)
+            token_output = self.word_embeddings_layer(token_ids)
+            extra_output = self.extra_word_embeddings_layer(extra_tokens)
+            embedding_output = tf.add(token_output,
+                                      extra_output * tf.expand_dims(tf.cast(extra_mask, K.floatx()), axis=-1))
+        else:
+            embedding_output = self.word_embeddings_layer(input_ids)
+
+        # ALBERT: for brightmart/albert_zh weights - project only token embeddings
+        if not self.params.project_position_embeddings:
+            if self.word_embeddings_projector_layer:
+                embedding_output = self.word_embeddings_projector_layer(embedding_output)
 
         if token_type_ids is not None:
             token_type_ids    = tf.cast(token_type_ids, dtype=tf.int32)
@@ -140,7 +215,7 @@ class BertEmbeddingsLayer(bert.Layer):
 
         if self.position_embeddings_layer is not None:
             seq_len  = input_ids.shape.as_list()[1]
-            emb_size = self.params.hidden_size
+            emb_size = embedding_output.shape[-1]
 
             pos_embeddings = self.position_embeddings_layer(seq_len)
             # broadcast over all dimension except the last two [..., seq_len, width]
@@ -149,6 +224,11 @@ class BertEmbeddingsLayer(bert.Layer):
 
         embedding_output = self.layer_norm_layer(embedding_output)
         embedding_output = self.dropout_layer(embedding_output, training=training)
+
+        # ALBERT: for google-research/albert weights - project all embeddings
+        if self.params.project_position_embeddings:
+            if self.word_embeddings_projector_layer:
+                embedding_output = self.word_embeddings_projector_layer(embedding_output)
 
         return embedding_output   # [B, seq_len, hidden_size]
 
@@ -160,7 +240,7 @@ class BertEmbeddingsLayer(bert.Layer):
             input_ids      = inputs
             token_type_ids = None
 
-        # if not self.mask_zero:
-        #   return None
+        if not self.support_masking:
+            return None
 
         return tf.not_equal(input_ids, 0)

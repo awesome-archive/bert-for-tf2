@@ -35,7 +35,7 @@ class TestExtendSegmentVocab(AbstractBertTest):
         model_dir = tempfile.TemporaryDirectory().name
         os.makedirs(model_dir)
         save_path = MiniBertFactory.create_mini_bert_weights(model_dir)
-        tokenizer = bert.FullTokenizer(vocab_file=os.path.join(model_dir, "vocab.txt"), do_lower_case=True)
+        tokenizer = bert.bert_tokenization.FullTokenizer(vocab_file=os.path.join(model_dir, "vocab.txt"), do_lower_case=True)
 
         ckpt_dir = os.path.dirname(save_path)
         bert_params = bert.params_from_pretrained_ckpt(ckpt_dir)
@@ -46,7 +46,8 @@ class TestExtendSegmentVocab(AbstractBertTest):
         l_bert = bert.BertModelLayer.from_params(bert_params)
 
         # we dummy call the layer once in order to instantiate the weights
-        l_bert([[[1]], [[1]]])
+        l_bert([np.array([[1, 1, 0]]),
+                np.array([[1, 0, 0]])])#, mask=[[True, True, False]])
 
         #
         # - load the weights from a pre-trained model,
